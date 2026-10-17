@@ -217,4 +217,9 @@ marimo/_lsp/
 __marimo__/
 
 # Streamlit
+.streamlit/
+
+# Local proxy rotator generated files
+config.json
+proxies_database.csv
 .streamlit/secrets.toml
