@@ -1,0 +1,210 @@
+# Техническое задание и ООП-архитектура: "Proxy Local Rotator & Checker"
+
+**Целевая ОС:** Linux  
+**Язык и стек:** Python 3.10+, PyQt6, `qasync`, `httpx`, `httpx-socks`, `python-socks[asyncio]`  
+**Архитектурный паттерн:** Layered Architecture (Domain / Data / Network / UI) + MVP / Контроллер с внедрением зависимостей (Dependency Injection).
+
+---
+
+## Часть 1. Архитектурные принципы и структура директорий (Строгие правила для LLM)
+
+1. **Принцип единой ответственности (SRP) и модульности:** Каждый основной класс должен находиться в своем собственном файле. Запрещено объединять UI, сетевую логику и хранение данных в одном модуле.
+2. **Слабая связность (Decoupling):** Слой `network` и слой `data` ничего не знают о `PyQt6`. Общение между бизнес-логикой и UI происходит через контроллер (`AppController`), колбэки или Qt-сигналы на уровне презентационного слоя.
+3. **Строгая типизация (Type Hints):** Все методы, атрибуты классов и возвращаемые значения должны быть аннотированы с помощью модуля `typing`.
+4. **Структура файлов проекта:**
+
+    proxy_rotator/
+    ├── config.json                     # Конфигурация (генерируется автоматически)
+    ├── proxies_database.csv            # Локальная БД прокси (генерируется автоматически)
+    ├── requirements.txt                # Зависимости проекта
+    ├── main.py                         # Точка входа (Composition Root, инициализация DI и qasync)
+    └── src/
+        ├── __init__.py
+        ├── domain/                     # Слой предметной области (Сущности, Enum, Конфиг)
+        │   ├── __init__.py
+        │   ├── enums.py                # Классы ProxyProtocol, ProxyStatus, LogLevel, AppState
+        │   ├── proxy_item.py           # Класс ProxyItem (бизнес-сущность прокси и ее методы)
+        │   └── app_config.py           # Класс AppConfig (структура настроек и валидация)
+        │
+        ├── data/                       # Слой работы с данными (Репозитории и парсеры)
+        │   ├── __init__.py
+        │   ├── proxy_parser.py         # Класс ProxyParser (разбор строк разных форматов)
+        │   ├── config_repository.py    # Класс ConfigRepository (чтение/запись config.json)
+        │   └── proxy_repository.py     # Класс ProxyRepository (in-memory словарь, дедупликация, CSV)
+        │
+        ├── network/                    # Сетевой слой (Асинхронные сервисы)
+        │   ├── __init__.py
+        │   ├── source_fetcher.py       # Класс ProxySourceFetcher (скачивание списков по URL)
+        │   ├── proxy_checker.py        # Класс ProxyCheckerService (мульти-URL чек, пинг, GeoIP)
+        │   ├── rotation_manager.py     # Класс ProxyRotationManager (очередь, фильтрация, учет сбоев)
+        │   └── local_server.py         # Класс LocalProxyServer (асинхронный TCP/HTTP/SOCKS сервер)
+        │
+        ├── presentation/               # Связующий слой (Управление состоянием и событиями)
+        │   ├── __init__.py
+        │   └── app_controller.py       # Класс AppController (связывает UI и сервисы бэкенда)
+        │
+        └── ui/                         # Графический интерфейс (PyQt6)
+            ├── __init__.py
+            ├── main_window.py          # Класс MainWindow (главное окно и компоновка)
+            ├── settings_dialog.py      # Класс SettingsDialog (модальное окно настроек)
+            ├── models/
+            │   ├── __init__.py
+            │   ├── proxy_table_model.py # Класс ProxyTableModel (QAbstractTableModel)
+            │   └── sort_proxy_model.py  # Класс ProxySortFilterModel (корректная сортировка чисел/дат)
+            └── widgets/
+                ├── __init__.py
+                ├── control_panel.py    # Класс ControlPanelWidget (верхняя панель кнопок и статус)
+                └── log_console.py      # Класс LogConsoleWidget (QTextEdit с цветовой разметкой)
+
+---
+
+## Часть 2. Функциональная спецификация и обязанности классов
+
+### 1. Слой `domain` (Модели и перечисления)
+* **`enums.py`:**
+  * `ProxyProtocol(str, Enum)`: `HTTP = "http"`, `HTTPS = "https"`, `SOCKS4 = "socks4"`, `SOCKS5 = "socks5"`.
+  * `ProxyStatus(str, Enum)`: `ACTIVE = "Active"`, `DEAD = "Dead"`, `CHECKING = "Checking"`, `UNTESTED = "Untested"`.
+  * `LogLevel(str, Enum)`: `INFO = "info"` (стандартный цвет), `SUCCESS = "success"` (зеленый), `ERROR = "error"` (красный).
+  * `AppState(str, Enum)`: `IDLE = "Idle"`, `RUNNING = "Running"`.
+* **`proxy_item.py` (`class ProxyItem`):**
+  * Атрибуты: `protocol: ProxyProtocol`, `host: str`, `port: int`, `username: Optional[str] = None`, `password: Optional[str] = None`, `location: str = "Unknown"`, `status: ProxyStatus = ProxyStatus.UNTESTED`, `ping: Optional[int] = None`, `url_status: str = "-"`, `added_at: str`, `fail_count: int = 0`, `dead_since: str = ""`.
+  * Методы бизнес-логики внутри класса:
+    * `unique_key -> str`: возвращает `f"{self.protocol.value}://{self.host}:{self.port}"`.
+    * `upstream_url -> str`: возвращает полный URL с авторизацией (`protocol://user:pass@host:port` или `protocol://host:port`).
+    * `register_success(ping_ms: int, url_status: str, location: Optional[str] = None) -> None`: сбрасывает `fail_count = 0`, очищает `dead_since = ""`, ставит `status = ProxyStatus.ACTIVE`, обновляет `ping` и `location` (если передан).
+    * `register_failure(max_attempts: int, url_status: str = "FAIL") -> bool`: увеличивает `fail_count += 1`. Если `fail_count == 1`, фиксирует текущее время в `dead_since`. Если `fail_count >= max_attempts`, переводит `status = ProxyStatus.DEAD` и возвращает `True` (прокси окончательно мертв).
+    * `reset_statistics() -> None`: обнуляет `fail_count = 0`, `dead_since = ""`, переводит статус в `ProxyStatus.ACTIVE`.
+* **`app_config.py` (`class AppConfig`):**
+  * Атрибуты: `proxy_sources: list[str]`, `local_port: int = 8080`, `preferred_countries: list[str]`, `test_urls: list[str]`, `connection_timeout_ms: int = 3000`, `response_timeout_ms: int = 5000`, `max_dead_attempts: int = 5`.
+  * Метод `validate() -> tuple[bool, str]`: проверяет корректность `test_urls` (схема `http`/`https`, наличие домена) и диапазоны таймаутов/портов.
+
+### 2. Слой `data` (Парсинг и хранение)
+* **`proxy_parser.py` (`class ProxyParser`):**
+  * Отвечает за парсинг сырых строк (`IP:Port`, `IP:Port:User:Pass`, `protocol://IP:Port`, `protocol://User:Pass@IP:Port`) в объекты `ProxyItem`.
+* **`config_repository.py` (`class ConfigRepository`):**
+  * Загружает и сохраняет `AppConfig` в локальный файл `config.json` рядом с программой. При отсутствии файла создает его с дефолтными параметрами.
+* **`proxy_repository.py` (`class ProxyRepository`):**
+  * Хранит коллекцию прокси в словаре `_items: dict[str, ProxyItem]`.
+  * Отвечает за загрузку при старте и сохранение в локальный файл `proxies_database.csv`.
+  * Метод `add_or_merge(new_items: list[ProxyItem]) -> int`: автоматическая дедупликация. Если `unique_key` уже есть в базе — старый объект **не перезаписывается** (сохраняется вся его статистика, пинг, дата добавления и сбои). Добавляются только новые узлы.
+  * Методы выборки:
+    * `get_available_protocols() -> list[str]`: возвращает уникальные типы протоколов, имеющиеся в базе, для заполнения `QComboBox`.
+    * `get_available_countries() -> list[str]`: возвращает уникальные коды стран (`location`) из базы для окна настроек.
+    * `get_working_pool(protocol: str, countries: list[str]) -> list[ProxyItem]`: возвращает прокси со статусом `Active` (и `Untested`), отфильтрованные по выбранному протоколу и предпочитаемым странам (если список стран пуст — берет все страны).
+
+### 3. Слой `network` (Сетевые сервисы)
+* **`source_fetcher.py` (`class ProxySourceFetcher`):**
+  * Асинхронно через `httpx` скачивает текстовые списки по всем URL из `proxy_sources` конфига и передает их в `ProxyParser`.
+* **`proxy_checker.py` (`class ProxyCheckerService`):**
+  * Асинхронно проверяет список `ProxyItem` (с ограничением конкурентности `asyncio.Semaphore(50)`).
+  * Использует `connection_timeout_ms` и `response_timeout_ms` из `AppConfig` (переводя их в секунды для `httpx.Timeout`).
+  * Проверяет доступность всех `test_urls`. Если прокси ответил и `location == "Unknown"`, определяет страну через запрос к `[http://ip-api.com/json/?fields=countryCode](http://ip-api.com/json/?fields=countryCode)` через этот же прокси.
+  * Вызывает `item.register_success(...)` или `item.register_failure(...)` (каждое нажатие кнопки «Проверить» при ошибке увеличивает счетчик попыток вплоть до `max_dead_attempts`, после чего прокси становится `Dead`).
+* **`rotation_manager.py` (`class ProxyRotationManager`):**
+  * Управляет рабочей очередью (`collections.deque[ProxyItem]`) во время работы локального прокси.
+  * Инициализируется отфильтрованными живыми прокси (по выбранному в UI протоколу и выбранным в настройках странам).
+  * Метод `get_current_proxy() -> Optional[ProxyItem]`: возвращает первый рабочий прокси из очереди.
+  * Метод `report_failure(proxy: ProxyItem) -> bool`: вызывает `proxy.register_failure(max_attempts)`. Если лимит не превышен — перемещает прокси в конец очереди (`deque`). Если лимит достигнут (`Dead`) — удаляет его из рабочей очереди.
+* **`local_server.py` (`class LocalProxyServer`):**
+  * Поднимает локальный прокси-сервер на `127.0.0.1:local_port` без авторизации.
+  * Принимает клиентские подключения и маршрутизирует их через прокси из `ProxyRotationManager` (используя `python-socks` для прозрачного туннелирования в апстрим выбранного протокола с учетом логина/пароля внешнего прокси).
+  * **Failover «На лету» (без фоновых таймеров):** Отдельный фоновый чекер по таймеру отсутствует. Если при обработке клиентского запроса внешний прокси выдал ошибку или таймаут, сервер вызывает `rotation_manager.report_failure()`, берет следующий прокси из очереди и повторяет попытку соединения без разрыва клиентской сессии.
+  * **Авто-остановка при гибели пула:** Если в `ProxyRotationManager` не осталось живых прокси (все перешли в `Dead`), локальный сервер автоматически останавливается, разблокирует UI и выводит в лог критическую ошибку красным цветом.
+
+### 4. Слой `ui` и `presentation` (Интерфейс и Управление)
+* **Главное окно (`MainWindow`) включает:**
+  1. `ControlPanelWidget`: кнопки `[Загрузить файл]`, `[Обновить]`, `[Проверить]`, `[Сброс статистики]`, выпадающий список протоколов `QComboBox`, кнопка `[⚙️ Настройки]`, текстовый индикатор статуса (`Работает` / `Остановлен`).
+  2. `QTableView` + `ProxyTableModel` + `ProxySortFilterModel`: таблица со столбцами (`Тип`, `Адрес`, `Локация`, `Статус`, `Пинг (мс)`, `URL Статус`, `Добавлен`, `Сбои`, `Мертв с`) с поддержкой вертикальной/горизонтальной прокрутки (Scrollbar) и корректной сортировки по клику на заголовки столбцов.
+  3. `LogConsoleWidget`: лог-консоль (`QTextEdit`, Read-Only) с цветовой индикацией:
+     * **Стандартный цвет:** обычные информационные события.
+     * **Зеленый цвет (`#2ecc71`):** успешный старт локального прокси с выводом готовой ссылки для подключения (например: `Локальный прокси запущен: socks5://127.0.0.1:8080`).
+     * **Красный цвет (`#e74c3c`):** ошибки таймаутов, сбои переключения прокси, остановка сервера из-за того, что все прокси мертвы.
+  4. Главная кнопка внизу окна: `[Запустить локальный прокси]` / `[Остановить локальный прокси]`.
+* **Машина состояний (State Machine):**
+  * В режиме `RUNNING` блокируются (`setEnabled(False)`) кнопки загрузки, обновления, проверки, сброса статистики, выбора типа протокола `QComboBox` и кнопка настроек `⚙️`. Активна только кнопка остановки сервера.
+
+---
+
+## Часть 3. Визуальные макеты (UI Wireframes)
+
+### 3.1. Главный экран
+
+    +-----------------------------------------------------------------------------------+
+    | [📁 Загрузить] [🔄 Обновить] [⚡ Проверить] [🧹 Сброс ст.] [Тип: ▼socks5] [⚙️] [🟢] |
+    +-----------------------------------------------------------------------------------+
+    | +-------------------------------------------------------------------------------+ |
+    | | Тип    | Адрес            | Локация | Статус  | Пинг | URL | Добавлен | Сбои  | |
+    | |--------|------------------|---------|---------|------|-----|----------|-------| |
+    | | http   | 192.168.1.1:8080 | US      | Active  | 45ms | OK  | 12.10 10 | 0/5   |▲|
+    | | socks5 | 10.0.0.5:1080    | DE      | Dead    | -    | FAIL| 11.10 15 | 5/5   |█|
+    | | http   | 172.16.0.4:3128  | RU      | Active  | 120ms| OK  | 12.10 12 | 1/5   |▼|
+    | +-------------------------------------------------------------------------------+ |
+    | Логи работы:                                                                      |
+    | +-------------------------------------------------------------------------------+ |
+    | | Загружена база из proxies_database.csv (150 записей)               | |
+    | | (ЗЕЛЕНЫЙ) Локальный прокси запущен: socks5://127.0.0.1:8080        | |
+    | | (КРАСНЫЙ) Ошибка 10.0.0.5:1080 (Timeout). Сбои: 5/5 -> Dead        | |
+    | | (КРАСНЫЙ) Все прокси мертвы. Локальный прокси-сервер остановлен.   | |
+    | +-------------------------------------------------------------------------------+ |
+    | [                     🔴 ОСТАНОВИТЬ ЛОКАЛЬНЫЙ ПРОКСИ                            ] |
+    +-----------------------------------------------------------------------------------+
+
+### 3.2. Окно настроек (`SettingsDialog`)
+
+    +----------------------------------------------------------+
+    | ⚙️ Настройки приложения                          [ X ]   |
+    +----------------------------------------------------------+
+    | Ссылки на списки прокси (по 1 в строку):                 |
+    | +------------------------------------------------------+ |
+    | | [https://example.com/proxies.txt](https://example.com/proxies.txt)                      | |
+    | | [https://another-source.org/list.txt](https://another-source.org/list.txt)                  | |
+    | +------------------------------------------------------+ |
+    | Порт локального прокси: [ 8080 ]                         |
+    | Предпочитаемые страны:  [☑ US] [☑ DE] [☐ RU]             |
+    | Тестовые URL (через запятую):                            |
+    | [ [https://gemini.google.com/app](https://gemini.google.com/app), [https://httpbin.org/ip](https://httpbin.org/ip) ]|
+    | Таймауты Connection / Response (мс): [ 3000 ] / [ 5000 ] |
+    | Лимит сбоев (Max Dead Attempts):     [ 5    ]            |
+    |----------------------------------------------------------|
+    |                 [ Отмена ]     [ Сохранить ]             |
+    +----------------------------------------------------------+
+
+---
+
+## Часть 4. Поэтапный план реализации для LLM (От простого к сложному)
+
+Реализуй проект строго итеративно, создавая каждый класс в отдельном файле согласно структуре из Части 1. После каждого этапа проверяй код юнит-тестами.
+
+### Этап 1: Слой `domain` (Сущности и бизнес-правила)
+1. Создай пакет `src/domain/`.
+2. Реализуй `enums.py` (`ProxyProtocol`, `ProxyStatus`, `LogLevel`, `AppState`).
+3. Реализуй `proxy_item.py` (`ProxyItem`) со всеми методами переходов состояний (`register_success`, `register_failure`, `reset_statistics`).
+4. Реализуй `app_config.py` (`AppConfig`) с методом валидации URL и целочисленных параметров.
+5. Проверка: напиши и запусти тест, проверяющий, что 5 вызовов `register_failure(max_attempts=5)` переводят прокси в `ProxyStatus.DEAD`, а `reset_statistics()` возвращает его в `ProxyStatus.ACTIVE` со счетчиком `0`.
+
+### Этап 2: Слой `data` (Парсер и Репозитории)
+1. Создай пакет `src/data/`.
+2. Реализуй `proxy_parser.py` (`ProxyParser`) с поддержкой форматов без авторизации и с авторизацией (`IP:Port:User:Pass` и `protocol://User:Pass@IP:Port`).
+3. Реализуй `config_repository.py` (`ConfigRepository`) для чтения и записи `config.json`.
+4. Реализуй `proxy_repository.py` (`ProxyRepository`) с сохранением/загрузкой `proxies_database.csv`, дедупликацией через словарь без перезаписи существующих прокси и методами фильтрации по протоколу и странам.
+5. Проверка: протестируй парсинг разных строк, сохранение в CSV и слияние дублирующихся списков прокси.
+
+### Этап 3: Слой `network` — Чекер, Загрузчик и Менеджер Ротации
+1. Создай пакет `src/network/`.
+2. Реализуй `source_fetcher.py` (`ProxySourceFetcher`) для асинхронного скачивания списков по URL через `httpx`.
+3. Реализуй `proxy_checker.py` (`ProxyCheckerService`) для мульти-URL проверки прокси (через `httpx` и `httpx-socks`), замера пинга в мс и определения страны (`location`) через GeoIP API.
+4. Реализуй `rotation_manager.py` (`ProxyRotationManager`) на базе `collections.deque`, реализующий перемещение сбойного прокси в конец очереди и исключение мертвых прокси при достижении `max_dead_attempts`.
+
+### Этап 4: Слой `network` — Локальный прокси-сервер с Failover
+1. Реализуй `src/network/local_server.py` (`LocalProxyServer`).
+2. Настрой асинхронный сервер (`asyncio.start_server`), который принимает соединения от локального клиента (HTTP/CONNECT и SOCKS) и туннелирует трафик через текущий прокси из `ProxyRotationManager` с помощью `python-socks`.
+3. Реализуй цикл Failover «на лету»: при ошибке или таймауте подключения к внешнему прокси вызывай `rotation_manager.report_failure()`, отправляй уведомление в лог и мгновенно переключайся на следующий прокси из очереди.
+4. Реализуй автоматическую остановку сервера с красным логом, если в `ProxyRotationManager` закончились живые прокси.
+
+### Этап 5: Слой `ui` и `presentation` (Сборка PyQt6 и DI)
+1. Создай пакет `src/ui/models/` и реализуй `ProxyTableModel` и `ProxySortFilterModel` (с корректной числовой сортировкой пинга и сбоев).
+2. Создай пакет `src/ui/widgets/` и реализуй `ControlPanelWidget` и `LogConsoleWidget` (с поддержкой цветных логов).
+3. Реализуй `src/ui/settings_dialog.py` (`SettingsDialog`) с динамическим списком чекбоксов стран из базы.
+4. Реализуй `src/ui/main_window.py` (`MainWindow`).
+5. Реализуй `src/presentation/app_controller.py` (`AppController`), связывающий сигналы UI, репозитории и сетевые сервисы, а также управляющий блокировкой кнопок в режиме `RUNNING`.
+6. Собери точку входа `main.py` с инициализацией `qasync.QEventLoop` и создай `requirements.txt`.
