@@ -1,0 +1,3 @@
+[tool.pyright]
+include = ["src", "tests"]
+extraPaths = [".", "src"]
