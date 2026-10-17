@@ -130,8 +130,11 @@ def test_control_panel_state_transitions():
     assert panel.btn_load_file.isEnabled()
     assert panel.btn_refresh.isEnabled()
     assert panel.btn_check.isEnabled()
+    assert panel.btn_check.text() == "⚡ Проверить"
     assert panel.btn_reset_stats.isEnabled()
     assert panel.btn_clear.isEnabled()
+    assert panel.btn_delete_selected.isEnabled()
+    assert panel.btn_delete_dead.isEnabled()
     assert panel.btn_settings.isEnabled()
     assert "Остановлен" in panel.lbl_status.text()
 
@@ -142,8 +145,19 @@ def test_control_panel_state_transitions():
     assert not panel.btn_check.isEnabled()
     assert not panel.btn_reset_stats.isEnabled()
     assert not panel.btn_clear.isEnabled()
+    assert not panel.btn_delete_selected.isEnabled()
+    assert not panel.btn_delete_dead.isEnabled()
     assert not panel.btn_settings.isEnabled()
     assert "Работает" in panel.lbl_status.text()
+
+    # Switch to CHECKING
+    panel.set_app_state(AppState.CHECKING)
+    assert panel.btn_check.isEnabled()
+    assert panel.btn_check.text() == "⏹️ Стоп"
+    assert not panel.btn_load_file.isEnabled()
+    assert not panel.btn_delete_selected.isEnabled()
+    assert not panel.btn_delete_dead.isEnabled()
+    assert "Проверка" in panel.lbl_status.text()
 
 
 def test_log_console_widget():

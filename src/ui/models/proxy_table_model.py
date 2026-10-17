@@ -116,6 +116,14 @@ class ProxyTableModel(QAbstractTableModel):
         self._items = list(items)
         self.endResetModel()
 
+    def set_max_attempts(self, max_attempts: int) -> None:
+        """Update max dead attempts threshold and notify view to re-render failure column."""
+        self.max_attempts = max_attempts
+        if self._items:
+            top_left = self.index(0, 7)
+            bottom_right = self.index(len(self._items) - 1, 7)
+            self.dataChanged.emit(top_left, bottom_right, [Qt.ItemDataRole.DisplayRole])
+
     def update_proxy(self, item: ProxyItem) -> None:
         """Find row by unique key and emit dataChanged to refresh UI."""
         target_key = item.unique_key

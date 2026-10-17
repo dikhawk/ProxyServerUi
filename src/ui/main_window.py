@@ -1,9 +1,11 @@
 """Main window application view layout."""
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QMainWindow,
+    QMenu,
     QPushButton,
     QSplitter,
     QTableView,
@@ -12,6 +14,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src.domain.enums import AppState
+from src.domain.proxy_item import ProxyItem
 from src.ui.models.proxy_table_model import ProxyTableModel
 from src.ui.models.sort_proxy_model import ProxySortFilterModel
 from src.ui.widgets.control_panel import ControlPanelWidget
@@ -64,6 +67,11 @@ class MainWindow(QMainWindow):
         v_header = self.table_view.verticalHeader()
         if v_header is not None:
             v_header.setVisible(False)
+
+        # Context menu on table view
+        self.table_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table_view.customContextMenuRequested.connect(self._show_table_context_menu)
+
         splitter.addWidget(self.table_view)
 
         # 3. Log console section
@@ -109,6 +117,7 @@ class MainWindow(QMainWindow):
         self.control_panel.set_app_state(state)
 
         if state == AppState.RUNNING:
+            self.btn_toggle_server.setEnabled(True)
             self.btn_toggle_server.setText("🔴 Остановить локальный прокси")
             self.btn_toggle_server.setStyleSheet(
                 """
@@ -125,7 +134,23 @@ class MainWindow(QMainWindow):
                 }
                 """
             )
+        elif state == AppState.CHECKING:
+            self.btn_toggle_server.setEnabled(False)
+            self.btn_toggle_server.setText("🟢 Запустить локальный прокси")
+            self.btn_toggle_server.setStyleSheet(
+                """
+                QPushButton {
+                    background-color: #7f8c8d;
+                    color: white;
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 10px;
+                    border-radius: 4px;
+                }
+                """
+            )
         else:
+            self.btn_toggle_server.setEnabled(True)
             self.btn_toggle_server.setText("🟢 Запустить локальный прокси")
             self.btn_toggle_server.setStyleSheet(
                 """
@@ -142,3 +167,37 @@ class MainWindow(QMainWindow):
                 }
                 """
             )
+
+    def _show_table_context_menu(self, pos: QPoint) -> None:
+        """Show context menu for proxy table with delete action."""
+        if not self.get_selected_proxies():
+            return
+        menu = QMenu(self)
+        action_delete = menu.addAction("❌ Удалить выбранные")
+        if action_delete is not None:
+            action_delete.triggered.connect(self.control_panel.btn_delete_selected.click)
+        vp = self.table_view.viewport()
+        if vp is not None:
+            menu.exec(vp.mapToGlobal(pos))
+
+    def keyPressEvent(self, a0: QKeyEvent | None) -> None:  # noqa: N802
+        """Handle keyboard shortcuts such as Delete key to remove proxies."""
+        if a0 and a0.key() == Qt.Key.Key_Delete:
+            self.control_panel.btn_delete_selected.click()
+        else:
+            super().keyPressEvent(a0)
+
+    def get_selected_proxies(self) -> list[ProxyItem]:
+        """Return list of ProxyItem currently selected in table view."""
+        selection_model = self.table_view.selectionModel()
+        if selection_model is None:
+            return []
+
+        selected_rows = selection_model.selectedRows()
+        items: list[ProxyItem] = []
+        for idx in selected_rows:
+            source_idx = self.sort_proxy_model.mapToSource(idx)
+            proxy = self.table_model.get_proxy(source_idx.row())
+            if proxy is not None:
+                items.append(proxy)
+        return items

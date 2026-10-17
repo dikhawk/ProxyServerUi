@@ -42,6 +42,8 @@ class AppController:
         self.rotation_manager: ProxyRotationManager | None = None
         self.local_server: LocalProxyServer | None = None
 
+        self._checker_service: ProxyCheckerService | None = None
+        self._check_task: asyncio.Task[Any] | None = None
         self._active_async_tasks: set[asyncio.Task[Any]] = set()
 
     def initialize(self) -> None:
@@ -52,6 +54,7 @@ class AppController:
         # Populate initial UI state
         all_items = self.proxy_repo.get_all()
         self.window.table_model.set_proxies(all_items)
+        self.window.table_model.set_max_attempts(self.config.max_dead_attempts)
         self.window.control_panel.update_protocols(self.proxy_repo.get_available_protocols())
         self.window.set_app_state(AppState.IDLE)
 
@@ -70,6 +73,8 @@ class AppController:
         cp.btn_check.clicked.connect(self.on_check_clicked)
         cp.btn_reset_stats.clicked.connect(self.on_reset_stats_clicked)
         cp.btn_clear.clicked.connect(self.on_clear_clicked)
+        cp.btn_delete_selected.clicked.connect(self.on_delete_selected_clicked)
+        cp.btn_delete_dead.clicked.connect(self.on_delete_dead_clicked)
         cp.btn_settings.clicked.connect(self.on_settings_clicked)
 
         self.window.btn_toggle_server.clicked.connect(self.on_toggle_server_clicked)
@@ -139,27 +144,60 @@ class AppController:
         )
 
     def on_check_clicked(self) -> None:
-        """Start async checking of proxies."""
+        """Toggle proxy checking: start if idle, stop if currently checking."""
+        if self.state == AppState.CHECKING:
+            self._stop_check_flow()
+            return
+
         items = self.proxy_repo.get_all()
         if not items:
             self._log("База прокси пуста. Нечего проверять.", LogLevel.INFO)
             return
 
         self._log(f"Запуск проверки {len(items)} прокси...", LogLevel.INFO)
-        self._run_task(self._async_check(items))
+        self.state = AppState.CHECKING
+        self.window.set_app_state(AppState.CHECKING)
+        self._check_task = asyncio.create_task(self._async_check(items))
+        self._active_async_tasks.add(self._check_task)
+        self._check_task.add_done_callback(self._active_async_tasks.discard)
+
+    def _stop_check_flow(self) -> None:
+        """Cancel ongoing proxy checking task and service."""
+        if self._checker_service:
+            self._checker_service.cancel()
+        if self._check_task and not self._check_task.done():
+            self._check_task.cancel()
+        self.state = AppState.IDLE
+        self.window.set_app_state(AppState.IDLE)
+        self._log("Остановка проверки прокси...", LogLevel.INFO)
 
     async def _async_check(self, items: list[ProxyItem]) -> None:
-        checker = ProxyCheckerService(
-            config=self.config,
-            log_callback=self._log,
-        )
+        try:
+            self._checker_service = ProxyCheckerService(
+                config=self.config,
+                log_callback=self._log,
+            )
 
-        def _on_item_done(item: ProxyItem) -> None:
-            self.window.table_model.update_proxy(item)
+            def _on_item_done(item: ProxyItem) -> None:
+                self.window.table_model.update_proxy(item)
 
-        await checker.check_all(items, on_item_completed=_on_item_done)
-        self.proxy_repo.save()
-        self._log("Проверка прокси завершена.", LogLevel.INFO)
+            await self._checker_service.check_all(
+                items,
+                on_item_completed=_on_item_done,
+                single_check=True,
+            )
+            self.proxy_repo.save()
+            self._log("Проверка прокси завершена.", LogLevel.INFO)
+        except asyncio.CancelledError:
+            self.proxy_repo.save()
+            self._log("Проверка прокси остановлена пользователем.", LogLevel.INFO)
+        except Exception as exc:
+            self._log(f"Ошибка при проверке прокси: {exc}", LogLevel.ERROR)
+        finally:
+            self._checker_service = None
+            self._check_task = None
+            self.state = AppState.IDLE
+            self.window.set_app_state(AppState.IDLE)
 
     def on_reset_stats_clicked(self) -> None:
         """Reset failure counts and dead timestamps for all proxies."""
@@ -188,6 +226,31 @@ class AppController:
             self.window.control_panel.update_protocols([])
             self._log("База прокси полностью очищена.", LogLevel.INFO)
 
+    def on_delete_selected_clicked(self) -> None:
+        """Delete user-selected proxies from table and repository."""
+        selected = self.window.get_selected_proxies()
+        if not selected:
+            self._log("Не выбрано ни одного прокси для удаления.", LogLevel.INFO)
+            return
+
+        removed = self.proxy_repo.remove_items(selected)
+        self.window.table_model.set_proxies(self.proxy_repo.get_all())
+        self.window.control_panel.update_protocols(self.proxy_repo.get_available_protocols())
+        self._log(
+            f"Удалено {removed} прокси вручную (всего в базе: {self.proxy_repo.count()})",
+            LogLevel.INFO,
+        )
+
+    def on_delete_dead_clicked(self) -> None:
+        """Delete all proxies marked as DEAD from database."""
+        removed = self.proxy_repo.remove_dead()
+        self.window.table_model.set_proxies(self.proxy_repo.get_all())
+        self.window.control_panel.update_protocols(self.proxy_repo.get_available_protocols())
+        self._log(
+            f"Удалено {removed} нерабочих (Dead) прокси (всего в базе: {self.proxy_repo.count()})",
+            LogLevel.INFO,
+        )
+
     def on_settings_clicked(self) -> None:
         """Open settings dialog and persist valid changes."""
         dialog = SettingsDialog(
@@ -204,17 +267,31 @@ class AppController:
 
             self.config = new_config
             self.config_repo.save(self.config)
+            self.window.table_model.set_max_attempts(self.config.max_dead_attempts)
+            if self.rotation_manager:
+                self.rotation_manager.max_attempts = self.config.max_dead_attempts
             self._log("Настройки успешно сохранены.", LogLevel.INFO)
 
     def on_toggle_server_clicked(self) -> None:
         """Toggle local proxy server running state."""
         if self.state == AppState.IDLE:
             self._start_server_flow()
-        else:
+        elif self.state == AppState.RUNNING:
             self._stop_server_flow()
+
+    def _on_pool_updated(self, active: int, total: int) -> None:
+        """Update active vs total proxies counter in UI."""
+        self.window.control_panel.set_active_proxy_count(active, total)
+
+    def _on_proxy_status_changed(self, item: ProxyItem) -> None:
+        """Update proxy row in table when its status or fail count changes during server operation."""
+        self.window.table_model.update_proxy(item)
 
     def _start_server_flow(self) -> None:
         """Verify selected protocol and pool, then launch local proxy server."""
+        if self.state != AppState.IDLE:
+            return
+
         protocol = self.window.control_panel.get_selected_protocol()
         if not protocol:
             QMessageBox.warning(
@@ -248,6 +325,8 @@ class AppController:
             rotation_manager=self.rotation_manager,
             log_callback=self._log,
             on_pool_exhausted=self._on_pool_exhausted,
+            on_pool_updated=self._on_pool_updated,
+            on_proxy_status_changed=self._on_proxy_status_changed,
         )
 
         self._run_task(self._async_start_server())
@@ -258,8 +337,10 @@ class AppController:
                 await self.local_server.start()
                 self.state = AppState.RUNNING
                 self.window.set_app_state(AppState.RUNNING)
+                self.local_server._notify_pool_updated()
             except Exception as e:
                 self._log(f"Не удалось запустить локальный сервер: {e}", LogLevel.ERROR)
+                self.local_server = None
                 self.state = AppState.IDLE
                 self.window.set_app_state(AppState.IDLE)
 
@@ -268,16 +349,20 @@ class AppController:
         self._run_task(self._async_stop_server())
 
     async def _async_stop_server(self) -> None:
-        if self.local_server:
-            await self.local_server.stop()
+        try:
+            if self.local_server:
+                await self.local_server.stop()
+        except Exception as e:
+            self._log(f"Ошибка при остановке сервера: {e}", LogLevel.ERROR)
+        finally:
             self.local_server = None
-
-        self.state = AppState.IDLE
-        self.window.set_app_state(AppState.IDLE)
-        self.proxy_repo.save()
+            self.state = AppState.IDLE
+            self.window.set_app_state(AppState.IDLE)
+            self.proxy_repo.save()
 
     def _on_pool_exhausted(self) -> None:
         """Callback invoked when all proxies in rotation manager have died."""
+        self.local_server = None
         self.state = AppState.IDLE
         self.window.set_app_state(AppState.IDLE)
         self.proxy_repo.save()
