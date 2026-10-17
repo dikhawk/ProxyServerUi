@@ -10,6 +10,7 @@ from python_socks.async_.asyncio import Proxy
 
 from src.domain.app_config import AppConfig
 from src.domain.enums import LogLevel
+from src.domain.proxy_item import ProxyItem
 from src.network.rotation_manager import ProxyRotationManager
 
 logger = logging.getLogger(__name__)
@@ -28,11 +29,16 @@ class LocalProxyServer:
         rotation_manager: ProxyRotationManager,
         log_callback: Callable[[str, LogLevel], None] | None = None,
         on_pool_exhausted: Callable[[], None] | None = None,
+        on_pool_updated: Callable[[int, int], None] | None = None,
+        on_proxy_status_changed: Callable[[ProxyItem], None] | None = None,
     ) -> None:
         self.config = config
         self.rotation_manager = rotation_manager
         self.log_callback = log_callback
         self.on_pool_exhausted = on_pool_exhausted
+        self.on_pool_updated = on_pool_updated
+        self.on_proxy_status_changed = on_proxy_status_changed
+        self.total_proxies = rotation_manager.active_count()
         self.is_running = False
         self._server: asyncio.Server | None = None
         self._active_tasks: set[asyncio.Task[None]] = set()
@@ -61,17 +67,25 @@ class LocalProxyServer:
             return "ProxyError"
         return type(exc).__name__
 
+    def _notify_pool_updated(self) -> None:
+        """Notify listener of current alive vs initial proxy count."""
+        if self.on_pool_updated:
+            with contextlib.suppress(Exception):
+                self.on_pool_updated(self.rotation_manager.active_count(), self.total_proxies)
+
     async def start(self) -> None:
         """Start listening on 127.0.0.1:local_port."""
         if self.is_running:
             return
 
+        self.total_proxies = self.rotation_manager.active_count()
         self._server = await asyncio.start_server(
             self._handle_client_connection,
             host="127.0.0.1",
             port=self.config.local_port,
         )
         self.is_running = True
+        self._notify_pool_updated()
         self._log(
             f"Локальный прокси запущен: http://127.0.0.1:{self.config.local_port}",
             LogLevel.SUCCESS,
@@ -79,19 +93,23 @@ class LocalProxyServer:
 
     async def stop(self) -> None:
         """Stop local server and close client connections."""
-        if not self.is_running and not self._server:
-            return
-
         self.is_running = False
-        if self._server:
-            self._server.close()
-            with contextlib.suppress(Exception):
-                await self._server.wait_closed()
-            self._server = None
 
         for task in list(self._active_tasks):
             task.cancel()
         self._active_tasks.clear()
+
+        if self._server:
+            if hasattr(self._server, "close_clients"):
+                with contextlib.suppress(Exception):
+                    self._server.close_clients()
+            if hasattr(self._server, "abort_clients"):
+                with contextlib.suppress(Exception):
+                    self._server.abort_clients()
+            self._server.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._server.wait_closed(), timeout=0.5)
+            self._server = None
 
         self._log("Локальный прокси-сервер остановлен.", LogLevel.INFO)
 
@@ -111,6 +129,7 @@ class LocalProxyServer:
         client_writer: asyncio.StreamWriter,
     ) -> None:
         """Process an individual client connection."""
+        upstream_writer: asyncio.StreamWriter | None = None
         try:
             # Read request line and headers
             header_data = bytearray()
@@ -221,6 +240,12 @@ class LocalProxyServer:
                     reason = self._format_error(exc)
                     is_dead = self.rotation_manager.report_failure(current_proxy)
                     dead_note = " -> Dead" if is_dead else ""
+                    if self.on_proxy_status_changed:
+                        with contextlib.suppress(Exception):
+                            self.on_proxy_status_changed(current_proxy)
+                    if is_dead:
+                        self._notify_pool_updated()
+
                     self._log(
                         f"Ошибка обращения к {target_display} через {current_proxy.host}:{current_proxy.port} | "
                         f"Причина: {reason}. Сбои: {current_proxy.fail_count}/{self.config.max_dead_attempts}{dead_note}",
@@ -297,6 +322,8 @@ class LocalProxyServer:
             logger.debug("Exception processing client connection: %s", exc)
         finally:
             self._safe_close_writer(client_writer)
+            if upstream_writer is not None:
+                self._safe_close_writer(upstream_writer)
 
     def _handle_exhausted_pool(self, client_writer: asyncio.StreamWriter) -> None:
         """Handle scenario when all proxies in rotation manager are dead."""

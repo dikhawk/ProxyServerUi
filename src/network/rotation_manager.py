@@ -49,14 +49,26 @@ class ProxyRotationManager:
         """
         is_dead = proxy.register_failure(self.max_attempts)
 
-        if is_dead or proxy.status == ProxyStatus.DEAD:
+        # Find target in queue by identity or unique_key
+        target: ProxyItem | None = None
+        for it in self._queue:
+            if it is proxy or it.unique_key == proxy.unique_key:
+                target = it
+                break
+
+        if target is not None:
+            if target is not proxy:
+                target.register_failure(self.max_attempts)
             with contextlib.suppress(ValueError):
-                self._queue.remove(proxy)
+                self._queue.remove(target)
+
+        if is_dead or proxy.status == ProxyStatus.DEAD:
             return True
 
         # Move failed proxy to the end of the queue
-        with contextlib.suppress(ValueError):
-            self._queue.remove(proxy)
+        if target is not None:
+            self._queue.append(target)
+        else:
             self._queue.append(proxy)
         return False
 

@@ -13,9 +13,12 @@ from src.domain.proxy_item import ProxyItem
 
 logger = logging.getLogger(__name__)
 
+# In-memory GeoIP cache to avoid repeated network lookups across runs
+_GEOIP_CACHE: dict[str, str] = {}
+
 
 class ProxyCheckerService:
-    """Asynchronously validates proxies against test URLs with concurrency limits."""
+    """Asynchronously validates proxies against test URLs with concurrency limits and cancellation."""
 
     def __init__(
         self,
@@ -26,6 +29,14 @@ class ProxyCheckerService:
         self.config = config
         self.log_callback = log_callback
         self.semaphore = asyncio.Semaphore(max_concurrency)
+        self._is_cancelled = False
+        self._running_tasks: set[asyncio.Task[ProxyItem]] = set()
+
+    def cancel(self) -> None:
+        """Cancel ongoing check process and all running tasks."""
+        self._is_cancelled = True
+        for task in list(self._running_tasks):
+            task.cancel()
 
     def _log(self, message: str, level: LogLevel = LogLevel.INFO) -> None:
         """Deliver log message to UI callback and logging system."""
@@ -51,26 +62,102 @@ class ProxyCheckerService:
 
     async def _fetch_geoip(
         self,
-        client: httpx.AsyncClient,
+        host: str,
+        client: httpx.AsyncClient | None = None,
     ) -> str | None:
-        """Query GeoIP service through proxy to identify country code."""
+        """
+        Query GeoIP service to identify country code for host/proxy.
+        Tries proxy connection first if provided, then falls back to direct lookups
+        across multiple resilient free GeoIP providers with in-memory caching.
+        """
+        if host in _GEOIP_CACHE:
+            return _GEOIP_CACHE[host]
+
+        # 1. Try through proxy client if provided
+        if client is not None:
+            try:
+                resp = await client.get(
+                    "http://ip-api.com/json/?fields=countryCode",
+                    timeout=2.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    code = data.get("countryCode")
+                    if isinstance(code, str) and len(code.strip()) == 2:
+                        res = code.strip().upper()
+                        _GEOIP_CACHE[host] = res
+                        return res
+            except Exception as e:
+                logger.debug("GeoIP query via proxy client failed for %s: %s", host, e)
+
+        # 2. Direct lookup fallback across multiple providers
         try:
-            resp = await client.get(
-                "http://ip-api.com/json/?fields=countryCode",
-                timeout=4.0,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                code = data.get("countryCode")
-                if isinstance(code, str) and code.strip():
-                    return code.strip().upper()
-        except Exception:
-            return None
+            async with httpx.AsyncClient(timeout=3.0, follow_redirects=True) as direct_client:
+                # Provider 1: api.country.is
+                try:
+                    resp = await direct_client.get(f"https://api.country.is/{host}")
+                    if resp.status_code == 200:
+                        code = resp.json().get("country")
+                        if isinstance(code, str) and len(code.strip()) == 2:
+                            res = code.strip().upper()
+                            _GEOIP_CACHE[host] = res
+                            return res
+                except Exception as e:
+                    logger.debug("GeoIP country.is failed for %s: %s", host, e)
+
+                # Provider 2: ipwho.is
+                try:
+                    resp = await direct_client.get(f"https://ipwho.is/{host}")
+                    if resp.status_code == 200:
+                        code = resp.json().get("country_code")
+                        if isinstance(code, str) and len(code.strip()) == 2:
+                            res = code.strip().upper()
+                            _GEOIP_CACHE[host] = res
+                            return res
+                except Exception as e:
+                    logger.debug("GeoIP ipwho.is failed for %s: %s", host, e)
+
+                # Provider 3: ip-api.com
+                try:
+                    resp = await direct_client.get(f"http://ip-api.com/json/{host}?fields=countryCode")
+                    if resp.status_code == 200:
+                        code = resp.json().get("countryCode")
+                        if isinstance(code, str) and len(code.strip()) == 2:
+                            res = code.strip().upper()
+                            _GEOIP_CACHE[host] = res
+                            return res
+                except Exception as e:
+                    logger.debug("GeoIP ip-api.com failed for %s: %s", host, e)
+
+                # Provider 4: freeipapi.com
+                try:
+                    resp = await direct_client.get(f"https://freeipapi.com/api/json/{host}")
+                    if resp.status_code == 200:
+                        code = resp.json().get("countryCode")
+                        if isinstance(code, str) and len(code.strip()) == 2:
+                            res = code.strip().upper()
+                            _GEOIP_CACHE[host] = res
+                            return res
+                except Exception as e:
+                    logger.debug("GeoIP freeipapi.com failed for %s: %s", host, e)
+        except Exception as e:
+            logger.debug("Direct GeoIP client error for %s: %s", host, e)
+
         return None
 
-    async def check_item(self, item: ProxyItem) -> bool:
-        """Validate a single proxy item against all configured test URLs."""
+    async def check_item(
+        self,
+        item: ProxyItem,
+        single_check: bool = False,
+    ) -> bool:
+        """Validate a single proxy item against configured test URL(s)."""
+        if self._is_cancelled:
+            return False
+
         async with self.semaphore:
+            if self._is_cancelled:
+                return False
+
             item.status = ProxyStatus.CHECKING
 
             connect_sec = max(0.1, self.config.connection_timeout_ms / 1000.0)
@@ -90,15 +177,19 @@ class ProxyCheckerService:
                     f"[Чекер] Ошибка {item.host}:{item.port} | Причина: {reason}",
                     LogLevel.ERROR,
                 )
-                item.register_failure(
-                    max_attempts=self.config.max_dead_attempts,
-                    url_status="CONFIG_ERR",
-                )
+                if single_check:
+                    item.mark_dead(self.config.max_dead_attempts, "CONFIG_ERR")
+                else:
+                    item.register_failure(
+                        max_attempts=self.config.max_dead_attempts,
+                        url_status="CONFIG_ERR",
+                    )
                 return False
 
             pings: list[int] = []
             last_status = "200"
             all_succeeded = True
+            test_urls = self.config.test_urls or ["https://google.com/"]
 
             try:
                 async with httpx.AsyncClient(
@@ -106,7 +197,9 @@ class ProxyCheckerService:
                     timeout=timeout,
                     headers={"User-Agent": "Mozilla/5.0 (ProxyRotator/1.0)"},
                 ) as client:
-                    for test_url in self.config.test_urls:
+                    for test_url in test_urls:
+                        if self._is_cancelled:
+                            return False
                         t0 = time.perf_counter()
                         try:
                             response = await client.get(test_url)
@@ -137,12 +230,15 @@ class ProxyCheckerService:
                             )
                             break
 
-                    if all_succeeded:
-                        # Determine country if currently Unknown
-                        location = None
-                        if item.location in ("Unknown", "-", "", None):
-                            location = await self._fetch_geoip(client)
+                    # Always resolve location if unknown
+                    location = None
+                    if item.location in ("Unknown", "-", "", None):
+                        location = await self._fetch_geoip(
+                            item.host,
+                            client=client if all_succeeded else None,
+                        )
 
+                    if all_succeeded:
                         avg_ping = int(sum(pings) / len(pings)) if pings else 1
                         item.register_success(
                             ping_ms=avg_ping,
@@ -151,10 +247,15 @@ class ProxyCheckerService:
                         )
                         return True
                     else:
-                        item.register_failure(
-                            max_attempts=self.config.max_dead_attempts,
-                            url_status="FAIL",
-                        )
+                        if location:
+                            item.location = location
+                        if single_check:
+                            item.mark_dead(self.config.max_dead_attempts, "FAIL")
+                        else:
+                            item.register_failure(
+                                max_attempts=self.config.max_dead_attempts,
+                                url_status="FAIL",
+                            )
                         return False
 
             except Exception as exc:
@@ -163,26 +264,46 @@ class ProxyCheckerService:
                     f"[Чекер] Ошибка {item.host}:{item.port} | Причина: {reason}",
                     LogLevel.ERROR,
                 )
-                item.register_failure(
-                    max_attempts=self.config.max_dead_attempts,
-                    url_status="FAIL",
-                )
+                if item.location in ("Unknown", "-", "", None):
+                    loc = await self._fetch_geoip(item.host)
+                    if loc:
+                        item.location = loc
+
+                if single_check:
+                    item.mark_dead(self.config.max_dead_attempts, "FAIL")
+                else:
+                    item.register_failure(
+                        max_attempts=self.config.max_dead_attempts,
+                        url_status="FAIL",
+                    )
                 return False
 
     async def check_all(
         self,
         items: list[ProxyItem],
         on_item_completed: Callable[[ProxyItem], None] | None = None,
+        single_check: bool = False,
     ) -> list[ProxyItem]:
         """Check all proxies concurrently and report progress via callback."""
         async def _check_and_notify(item: ProxyItem) -> ProxyItem:
-            await self.check_item(item)
-            if on_item_completed:
-                try:
-                    on_item_completed(item)
-                except Exception as e:
-                    logger.error("Error in on_item_completed callback: %s", e)
+            if not self._is_cancelled:
+                await self.check_item(item, single_check=single_check)
+                if on_item_completed and not self._is_cancelled:
+                    try:
+                        on_item_completed(item)
+                    except Exception as e:
+                        logger.error("Error in on_item_completed callback: %s", e)
             return item
 
-        tasks = [_check_and_notify(it) for it in items]
-        return await asyncio.gather(*tasks)
+        self._running_tasks = {
+            asyncio.create_task(_check_and_notify(it)) for it in items
+        }
+        for task in self._running_tasks:
+            task.add_done_callback(self._running_tasks.discard)
+
+        try:
+            results = await asyncio.gather(*self._running_tasks, return_exceptions=True)
+            return [it for it in results if isinstance(it, ProxyItem)]
+        except asyncio.CancelledError:
+            self.cancel()
+            raise
