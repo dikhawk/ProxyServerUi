@@ -22,6 +22,7 @@ def test_enums_values():
 
     assert AppState.IDLE.value == "Idle"
     assert AppState.RUNNING.value == "Running"
+    assert AppState.CHECKING.value == "Checking"
 
 
 def test_proxy_item_keys_and_urls():

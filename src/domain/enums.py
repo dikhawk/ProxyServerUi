@@ -2,7 +2,7 @@
 from enum import Enum
 
 
-class ProxyProtocol(str, Enum):
+class ProxyProtocol(Enum):
     """Supported proxy protocols."""
     HTTP = "http"
     HTTPS = "https"
@@ -10,7 +10,7 @@ class ProxyProtocol(str, Enum):
     SOCKS5 = "socks5"
 
 
-class ProxyStatus(str, Enum):
+class ProxyStatus(Enum):
     """Proxy health/activity status."""
     ACTIVE = "Active"
     DEAD = "Dead"
@@ -18,14 +18,15 @@ class ProxyStatus(str, Enum):
     UNTESTED = "Untested"
 
 
-class LogLevel(str, Enum):
+class LogLevel(Enum):
     """Log level for message coloring in the UI console."""
     INFO = "info"
     SUCCESS = "success"
     ERROR = "error"
 
 
-class AppState(str, Enum):
+class AppState(Enum):
     """Application running state."""
     IDLE = "Idle"
     RUNNING = "Running"
+    CHECKING = "Checking"

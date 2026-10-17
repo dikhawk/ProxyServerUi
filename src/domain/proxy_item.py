@@ -64,6 +64,15 @@ class ProxyItem:
             return True
         return False
 
+    def mark_dead(self, max_attempts: int, reason: str = "FAIL") -> None:
+        """Mark proxy as DEAD with max fail count, dead_since timestamp and url status."""
+        self.status = ProxyStatus.DEAD
+        self.fail_count = max_attempts
+        self.url_status = reason
+        self.ping = None
+        if not self.dead_since:
+            self.dead_since = datetime.now().strftime("%d.%m %H:%M")
+
     def reset_statistics(self) -> None:
         """Reset failures, clear dead_since, and return to ACTIVE status."""
         self.fail_count = 0

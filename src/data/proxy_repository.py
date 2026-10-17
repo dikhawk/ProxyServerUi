@@ -135,6 +135,30 @@ class ProxyRepository:
         self._items.clear()
         self._write_empty_csv()
 
+    def remove_by_keys(self, keys: list[str]) -> int:
+        """Remove proxies by unique keys. Returns number of removed items."""
+        removed = 0
+        for key in keys:
+            if key in self._items:
+                del self._items[key]
+                removed += 1
+        if removed > 0:
+            self.save()
+        return removed
+
+    def remove_items(self, items: list[ProxyItem]) -> int:
+        """Remove proxies by item instances. Returns number of removed items."""
+        keys = [item.unique_key for item in items]
+        return self.remove_by_keys(keys)
+
+    def remove_dead(self) -> int:
+        """Remove all proxies with DEAD status. Returns number of removed items."""
+        dead_keys = [
+            key for key, item in self._items.items()
+            if item.status == ProxyStatus.DEAD
+        ]
+        return self.remove_by_keys(dead_keys)
+
     def get_all(self) -> list[ProxyItem]:
         """Return all proxies in repository."""
         return list(self._items.values())
